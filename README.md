@@ -1,3 +1,8 @@
+
+This project is currently in progress and is not functional.
+
+Google sheet with notes: https://docs.google.com/spreadsheets/d/e/2PACX-1vTeYsXobBd5jx11QQlAjPntzDqYDTKzgOymx7yVam4rxejSY_BNkxnzwoQkQfZCF8bZjVew5t2QHhSV/pubhtml
+
 Abe: a free block chain browser for Bitcoin-based currencies.
 https://github.com/bitcoin-abe/bitcoin-abe
 
