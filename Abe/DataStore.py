@@ -87,7 +87,7 @@ CHAIN_CONFIG = [
     {"chain":"BlackCoin"},
     {"chain":"Unbreakablecoin"},
     {"chain":"Californium"},
-	{"chain":"Smartcash"},
+	{"chain":"Smartcash", "policy": "SHA256Chain",  "address_version":"\x3f"}
     #{"chain":"",
     # "code3":"", "address_version":"\x", "magic":""},
     ]
