@@ -16,14 +16,26 @@
 
 #**thehebs 3/5/2018 Changed ZCoin to Smartcash on line 23
 
-from . import BaseChain
-from .. import util
-from pprint import pprint
+#from . import BaseChain
+#from .. import util
+#from pprint import pprint
 
-class Smartcash(BaseChain):
-    """
-    A blockchain using 256-bit SHA3 (Keccak) as the block header hash.
-    """
-    def block_header_hash(chain, header):
-        pprint (vars(chain))
-        return util.sha3_256(header)
+#class Smartcash(BaseChain):
+    #"""
+    #A blockchain using 256-bit SHA3 (Keccak) as the block header hash.
+    #"""
+    #def block_header_hash(chain, header):
+        #pprint (vars(chain))
+        #return util.sha3_256(header)
+
+from .KeccakChain import KeccakChain
+
+class Smartcash(KeccakChain):
+    def __init__(chain, **kwargs):
+        chain.name = 'Smartcash'
+        chain.code3 = 'SMT'
+        chain.address_version ='\x00'
+        chain.script_addr_vers = '\x05'
+        chain.magic = '\x5c\xa1\xab\x1e'
+        KeccakChain.__init__(chain, **kwargs)
+

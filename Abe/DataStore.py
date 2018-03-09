@@ -86,8 +86,8 @@ CHAIN_CONFIG = [
     {"chain":"Dash"},
     {"chain":"BlackCoin"},
     {"chain":"Unbreakablecoin"},
-    {"chain":"Californium"},
-    {"chain":"Smartcash", "address_version":"\x00","policy":"Smartcash","code3":"SMT","magic":"\x5c\xa1\xab\x1e","script_addr_vers":"\x05"}
+    {"chain":"Californium"}
+    #{"chain":"Smartcash", "address_version":"\x00","policy":"Smartcash","code3":"SMT","magic":"\x5c\xa1\xab\x1e","script_addr_vers":"\x05"}
 	
     #{"chain":"",
     # "code3":"", "address_version":"\x", "magic":""},
@@ -1088,7 +1088,7 @@ store._ddl['txout_approx'],
         b['block_id'] = block_id
 
         if chain is not None:
-             #Verify Merkle root.
+             # Verify Merkle root.
             if b['hashMerkleRoot'] != chain.merkle_root(tx_hash_array):
                 raise MerkleRootMismatch(b['hash'], tx_hash_array)
 
