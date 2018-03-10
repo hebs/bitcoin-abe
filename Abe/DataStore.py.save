@@ -1,0 +1,947 @@
+# Copyright(C) 2011,2012,2013,2014 by Abe developers.
+
+# DataStore.py: back end database access for Abe.
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Affero General Public License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public
+# License along with this program.  If not, see
+# <http://www.gnu.org/licenses/agpl.html>.
+
+# This module combines three functions that might be better split up:
+# 1. Abe's schema
+# 2. Abstraction over the schema for importing blocks, etc.
+# 3. Code to load data by scanning blockfiles or using JSON-RPC.
+
+import os
+import re
+import time
+import errno
+import logging
+
+import SqlAbstraction
+
+import Chain
+
+# bitcointools -- modified deserialize.py to return raw transaction
+import BCDataStream
+import deserialize
+import util
+import base58
+
+SCHEMA_TYPE = "Abe"
+SCHEMA_VERSION = SCHEMA_TYPE + "41"
+
+CONFIG_DEFAULTS = {
+    "dbtype":             None,
+    "connect_args":       None,
+    "binary_type":        None,
+    "int_type":           None,
+    "upgrade":            None,
+    "rescan":             None,
+    "commit_bytes":       None,
+    "log_sql":            None,
+    "log_rpc":            None,
+    "default_chain":      "Bitcoin",
+    "datadir":            None,
+    "ignore_bit8_chains": None,
+    "use_firstbits":      False,
+    "keep_scriptsig":     True,
+    "import_tx":          [],
+    "default_loader":     "default",
+    "rpc_load_mempool":   False,
+}
+
+WORK_BITS = 304  # XXX more than necessary.
+
+CHAIN_CONFIG = [
+    {"chain":"Bitcoin"},
+    {"chain":"Testnet"},
+    {"chain":"Namecoin"},
+    {"chain":"Weeds", "policy":"Sha256Chain",
+     "code3":"WDS", "address_version":"\xf3", "magic":"\xf8\xbf\xb5\xda"},
+    {"chain":"BeerTokens", "policy":"Sha256Chain",
+     "code3":"BER", "address_version":"\xf2", "magic":"\xf7\xbf\xb5\xdb"},
+    {"chain":"SolidCoin", "policy":"Sha256Chain",
+     "code3":"SCN", "address_version":"\x7d", "magic":"\xde\xad\xba\xbe"},
+    {"chain":"ScTestnet", "policy":"Sha256Chain",
+     "code3":"SC0", "address_version":"\x6f", "magic":"\xca\xfe\xba\xbe"},
+    {"chain":"Worldcoin", "policy":"Sha256Chain",
+     "code3":"WDC", "address_version":"\x49", "magic":"\xfb\xc0\xb6\xdb"},
+    {"chain":"NovaCoin"},
+    {"chain":"CryptoCash"},
+    {"chain":"Anoncoin", "policy":"Sha256Chain",
+     "code3":"ANC", "address_version":"\x17", "magic":"\xFA\xCA\xBA\xDA" },
+    {"chain":"Hirocoin"},
+    {"chain":"Bitleu"},
+    {"chain":"Maxcoin"},
+    {"chain":"Dash"},
+    {"chain":"BlackCoin"},
+    {"chain":"Unbreakablecoin"},
+    {"chain":"Californium"},
+    #{"chain":"",
+    # "code3":"", "address_version":"\x", "magic":""},
+    ]
+
+NULL_PUBKEY_HASH = "\0" * Chain.PUBKEY_HASH_LENGTH
+NULL_PUBKEY_ID = 0
+PUBKEY_ID_NETWORK_FEE = NULL_PUBKEY_ID
+
+# Size of the script and pubkey columns in bytes.
+MAX_SCRIPT = SqlAbstraction.MAX_SCRIPT
+MAX_PUBKEY = SqlAbstraction.MAX_PUBKEY
+NO_CLOB = SqlAbstraction.NO_CLOB
+
+# XXX This belongs in another module.
+class InvalidBlock(Exception):
+    pass
+class MerkleRootMismatch(InvalidBlock):
+    def __init__(ex, block_hash, tx_hashes):
+        ex.block_hash = block_hash
+        ex.tx_hashes = tx_hashes
+    def __str__(ex):
+        return 'Block header Merkle root does not match its transactions. ' \
+            'block hash=%s' % (ex.block_hash[::-1].encode('hex'),)
+
+class MalformedHash(ValueError):
+    pass
+
+class MalformedAddress(ValueError):
+    pass
+
+class DataStore(object):
+
+    """
+    Bitcoin data storage class based on DB-API 2 and standard SQL with
+    workarounds to support SQLite3, PostgreSQL/psycopg2, MySQL,
+    Oracle, ODBC, and IBM DB2.
+    """
+
+    def __init__(store, args):
+        """
+        Open and store a connection to the SQL database.
+        args.dbtype should name a DB-API 2 driver module, e.g.,
+        "sqlite3".
+        args.connect_args should be an argument to the module's
+        connect() method, or None for no argument, or a list of
+        arguments, or a dictionary of named arguments.
+        args.datadir names Bitcoin data directories containing
+        blk0001.dat to scan for new blocks.
+        """
+        if args.datadir is None:
+            args.datadir = util.determine_db_dir()
+        if isinstance(args.datadir, str):
+            args.datadir = [args.datadir]
+
+        store.args = args
+        store.log = logging.getLogger(__name__)
+
+        store.rpclog = logging.getLogger(__name__ + ".rpc")
+        if not args.log_rpc:
+            store.rpclog.setLevel(logging.ERROR)
+
+        if args.dbtype is None:
+            store.log.warn("dbtype not configured, see abe.conf for examples");
+            store.dbmodule = None
+            store.config = CONFIG_DEFAULTS.copy()
+            store.datadirs = []
+            store.use_firstbits = CONFIG_DEFAULTS['use_firstbits']
+            store._sql = None
+            return
+        store.dbmodule = __import__(args.dbtype)
+
+        sql_args = lambda: 1
+        sql_args.module = store.dbmodule
+        sql_args.connect_args = args.connect_args
+        sql_args.binary_type = args.binary_type
+        sql_args.int_type = args.int_type
+        sql_args.log_sql = args.log_sql
+        sql_args.prefix = "abe_"
+        sql_args.config = {}
+        store.sql_args = sql_args
+        store.set_db(None)
+        store.init_sql()
+
+        store._blocks = {}
+
+        # Read the CONFIG and CONFIGVAR tables if present.
+        store.config = store._read_config()
+
+        if store.config is None:
+            store.keep_scriptsig = args.keep_scriptsig
+        elif 'keep_scriptsig' in store.config:
+            store.keep_scriptsig = store.config.get('keep_scriptsig') == "true"
+        else:
+            store.keep_scriptsig = CONFIG_DEFAULTS['keep_scriptsig']
+
+        store.refresh_ddl()
+
+        if store.config is None:
+            store.initialize()
+        else:
+            store.init_sql()
+
+            if store.config['schema_version'] == SCHEMA_VERSION:
+                pass
+            elif args.upgrade:
+                import upgrade
+                upgrade.upgrade_schema(store)
+            else:
+                raise Exception(
+                    "Database schema version (%s) does not match software"
+                    " (%s).  Please run with --upgrade to convert database."
+                    % (store.config['schema_version'], SCHEMA_VERSION))
+        store._sql.auto_reconnect = True
+
+        if args.rescan:
+            store.sql("UPDATE datadir SET blkfile_number=1, blkfile_offset=0")
+
+        store._init_datadirs()
+        store.init_chains()
+
+        store.commit_bytes = args.commit_bytes
+        if store.commit_bytes is None:
+            store.commit_bytes = 0  # Commit whenever possible.
+        else:
+            store.commit_bytes = int(store.commit_bytes)
+        store.bytes_since_commit = 0
+
+        store.use_firstbits = (store.config['use_firstbits'] == "true")
+
+        for hex_tx in args.import_tx:
+            chain_name = None
+            if isinstance(hex_tx, dict):
+                chain_name = hex_tx.get("chain")
+                hex_tx = hex_tx.get("tx")
+            store.maybe_import_binary_tx(chain_name, str(hex_tx).decode('hex'))
+
+        store.default_loader = args.default_loader
+
+        store.rpc_load_mempool = args.rpc_load_mempool
+
+        store.default_chain = args.default_chain;
+
+        store.commit()
+
+    def set_db(store, db):
+        store._sql = db
+
+    def get_db(store):
+        return store._sql
+
+    def connect(store):
+        return store._sql.connect()
+
+    def reconnect(store):
+        return store._sql.reconnect()
+
+    def close(store):
+        store._sql.close()
+
+    def commit(store):
+        store._sql.commit()
+
+    def rollback(store):
+        if store._sql is not None:
+            store._sql.rollback()
+
+    def sql(store, stmt, params=()):
+        store._sql.sql(stmt, params)
+
+    def ddl(store, stmt):
+        store._sql.ddl(stmt)
+
+    def selectrow(store, stmt, params=()):
+        return store._sql.selectrow(stmt, params)
+
+    def selectall(store, stmt, params=()):
+        return store._sql.selectall(stmt, params)
+
+    def rowcount(store):
+        return store._sql.rowcount()
+
+    def create_sequence(store, key):
+        store._sql.create_sequence(key)
+
+    def drop_sequence(store, key):
+        store._sql.drop_sequence(key)
+
+    def new_id(store, key):
+        return store._sql.new_id(key)
+
+    def init_sql(store):
+        sql_args = store.sql_args
+        if hasattr(store, 'config'):
+            for name in store.config.keys():
+                if name.startswith('sql.'):
+                    sql_args.config[name[len('sql.'):]] = store.config[name]
+        if store._sql:
+            store._sql.close()  # XXX Could just set_flavour.
+        store.set_db(SqlAbstraction.SqlAbstraction(sql_args))
+        store.init_binfuncs()
+
+    def init_binfuncs(store):
+        store.binin       = store._sql.binin
+        store.binin_hex   = store._sql.binin_hex
+        store.binin_int   = store._sql.binin_int
+        store.binout      = store._sql.binout
+        store.binout_hex  = store._sql.binout_hex
+        store.binout_int  = store._sql.binout_int
+        store.intin       = store._sql.intin
+        store.hashin      = store._sql.revin
+        store.hashin_hex  = store._sql.revin_hex
+        store.hashout     = store._sql.revout
+        store.hashout_hex = store._sql.revout_hex
+
+    def _read_config(store):
+        # Read table CONFIGVAR if it exists.
+        config = {}
+        try:
+            for name, value in store.selectall("""
+                SELECT configvar_name, configvar_value
+                  FROM configvar"""):
+                config[name] = '' if value is None else value
+            if config:
+                return config
+
+        except store.dbmodule.DatabaseError:
+            try:
+                store.rollback()
+            except Exception:
+                pass
+
+        # Read legacy table CONFIG if it exists.
+        try:
+            row = store.selectrow("""
+                SELECT schema_version, binary_type
+                  FROM config
+                 WHERE config_id = 1""")
+            sv, btype = row
+            return { 'schema_version': sv, 'binary_type': btype }
+        except Exception:
+            try:
+                store.rollback()
+            except Exception:
+                pass
+
+        # Return None to indicate no schema found.
+        return None
+
+    def _init_datadirs(store):
+        """Parse store.args.datadir, create store.datadirs."""
+        if store.args.datadir == []:
+            store.datadirs = []
+            return
+
+        datadirs = {}
+        for row in store.selectall("""
+            SELECT datadir_id, dirname, blkfile_number, blkfile_offset,
+                   chain_id
+              FROM datadir"""):
+            id, dir, num, offs, chain_id = row
+            datadirs[dir] = {
+                "id": id,
+                "dirname": dir,
+                "blkfile_number": int(num),
+                "blkfile_offset": int(offs),
+                "chain_id": None if chain_id is None else int(chain_id),
+                "loader": None}
+
+        #print("datadirs: %r" % datadirs)
+
+        # By default, scan every dir we know.  This doesn't happen in
+        # practise, because abe.py sets ~/.bitcoin as default datadir.
+        if store.args.datadir is None:
+            store.datadirs = datadirs.values()
+            return
+
+        def lookup_chain_id(name):
+            row = store.selectrow(
+                "SELECT chain_id FROM chain WHERE chain_name = ?",
+                (name,))
+            return None if row is None else int(row[0])
+
+        store.datadirs = []
+        for dircfg in store.args.datadir:
+            loader = None
+            conf = None
+
+            if isinstance(dircfg, dict):
+                #print("dircfg is dict: %r" % dircfg)  # XXX
+                dirname = dircfg.get('dirname')
+                if dirname is None:
+                    raise ValueError(
+                        'Missing dirname in datadir configuration: '
+                        + str(dircfg))
+                if dirname in datadirs:
+                    d = datadirs[dirname]
+                    d['loader'] = dircfg.get('loader')
+                    d['conf'] = dircfg.get('conf')
+                    if d['chain_id'] is None and 'chain' in dircfg:
+                        d['chain_id'] = lookup_chain_id(dircfg['chain'])
+                    store.datadirs.append(d)
+                    continue
+
+                loader = dircfg.get('loader')
+                conf = dircfg.get('conf')
+                chain_id = dircfg.get('chain_id')
+                if chain_id is None:
+                    chain_name = dircfg.get('chain')
+                    chain_id = lookup_chain_id(chain_name)
+
+                    if chain_id is None and chain_name is not None:
+                        chain_id = store.new_id('chain')
+
+                        code3 = dircfg.get('code3')
+                        if code3 is None:
+                            # XXX Should default via policy.
+                            code3 = '000' if chain_id > 999 else "%03d" % (
+                                chain_id,)
+
+                        addr_vers = dircfg.get('address_version')
+                        if addr_vers is None:
+                            addr_vers = "\0"
+                        elif isinstance(addr_vers, unicode):
+                            addr_vers = addr_vers.encode('latin_1')
+
+                        script_addr_vers = dircfg.get('script_addr_vers')
+                        if script_addr_vers is None:
+                            script_addr_vers = "\x05"
+                        elif isinstance(script_addr_vers, unicode):
+                            script_addr_vers = script_addr_vers.encode('latin_1')
+
+                        decimals = dircfg.get('decimals')
+                        if decimals is not None:
+                            decimals = int(decimals)
+
+                        # XXX Could do chain_magic, but this datadir won't
+                        # use it, because it knows its chain.
+
+                        store.sql("""
+                            INSERT INTO chain (
+                                chain_id, chain_name, chain_code3,
+                                chain_address_version, chain_script_addr_vers, chain_policy,
+                                chain_decimals
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                                  (chain_id, chain_name, code3,
+                                   store.binin(addr_vers), store.binin(script_addr_vers),
+                                   dircfg.get('policy', chain_name), decimals))
+                        store.commit()
+                        store.log.warning("Assigned chain_id %d to %s",
+                                          chain_id, chain_name)
+
+            elif dircfg in datadirs:
+                store.datadirs.append(datadirs[dircfg])
+                continue
+            else:
+                # Not a dict.  A string naming a directory holding
+                # standard chains.
+                dirname = dircfg
+                chain_id = None
+
+            d = {
+                "id": store.new_id("datadir"),
+                "dirname": dirname,
+                "blkfile_number": 1,
+                "blkfile_offset": 0,
+                "chain_id": chain_id,
+                "loader": loader,
+                "conf": conf,
+                }
+            store.datadirs.append(d)
+
+    def init_chains(store):
+        store.chains_by = lambda: 0
+        store.chains_by.id = {}
+        store.chains_by.name = {}
+        store.chains_by.magic = {}
+
+        # Legacy config option.
+        no_bit8_chains = store.args.ignore_bit8_chains or []
+        if isinstance(no_bit8_chains, str):
+            no_bit8_chains = [no_bit8_chains]
+
+        for chain_id, magic, chain_name, chain_code3, address_version, script_addr_vers, \
+                chain_policy, chain_decimals in \
+                store.selectall("""
+                    SELECT chain_id, chain_magic, chain_name, chain_code3,
+                           chain_address_version, chain_script_addr_vers, chain_policy, chain_decimals
+                      FROM chain
+                """):
+            chain = Chain.create(
+                id              = int(chain_id),
+                magic           = store.binout(magic),
+                name            = unicode(chain_name),
+                code3           = chain_code3 and unicode(chain_code3),
+                address_version = store.binout(address_version),
+                script_addr_vers = store.binout(script_addr_vers),
+                policy          = unicode(chain_policy),
+                decimals        = None if chain_decimals is None else \
+                    int(chain_decimals))
+
+            # Legacy config option.
+            if chain.name in no_bit8_chains and \
+                    chain.has_feature('block_version_bit8_merge_mine'):
+                chain = Chain.create(src=chain, policy="LegacyNoBit8")
+
+            store.chains_by.id[chain.id] = chain
+            store.chains_by.name[chain.name] = chain
+            store.chains_by.magic[bytes(chain.magic)] = chain
+
+    def get_chain_by_id(store, chain_id):
+        return store.chains_by.id[int(chain_id)]
+
+    def get_chain_by_name(store, name):
+        return store.chains_by.name.get(name, None)
+
+    def get_default_chain(store):
+        store.log.debug("Falling back to default (Bitcoin) policy.")
+        return Chain.create(store.default_chain)
+
+    def get_ddl(store, key):
+        return store._ddl[key]
+
+    def refresh_ddl(store):
+        store._ddl = {
+            "chain_summary":
+# XXX I could do a lot with MATERIALIZED views.
+"""CREATE VIEW chain_summary AS SELECT
+    cc.chain_id,
+    cc.in_longest,
+    b.block_id,
+    b.block_hash,
+    b.block_version,
+    b.block_hashMerkleRoot,
+    b.block_nTime,
+    b.block_nBits,
+    b.block_nNonce,
+    cc.block_height,
+    b.prev_block_id,
+    prev.block_hash prev_block_hash,
+    b.block_chain_work,
+    b.block_num_tx,
+    b.block_value_in,
+    b.block_value_out,
+    b.block_total_satoshis,
+    b.block_total_seconds,
+    b.block_satoshi_seconds,
+    b.block_total_ss,
+    b.block_ss_destroyed
+FROM chain_candidate cc
+JOIN block b ON (cc.block_id = b.block_id)
+LEFT JOIN block prev ON (b.prev_block_id = prev.block_id)""",
+
+            "txout_detail":
+"""CREATE VIEW txout_detail AS SELECT
+    cc.chain_id,
+    cc.in_longest,
+    cc.block_id,
+    b.block_hash,
+    b.block_height,
+    block_tx.tx_pos,
+    tx.tx_id,
+    tx.tx_hash,
+    tx.tx_lockTime,
+    tx.tx_version,
+    tx.tx_size,
+    txout.txout_id,
+    txout.txout_pos,
+    txout.txout_value,
+    txout.txout_scriptPubKey,
+    pubkey.pubkey_id,
+    pubkey.pubkey_hash,
+    pubkey.pubkey
+  FROM chain_candidate cc
+  JOIN block b ON (cc.block_id = b.block_id)
+  JOIN block_tx ON (b.block_id = block_tx.block_id)
+  JOIN tx    ON (tx.tx_id = block_tx.tx_id)
+  JOIN txout ON (tx.tx_id = txout.tx_id)
+  LEFT JOIN pubkey ON (txout.pubkey_id = pubkey.pubkey_id)""",
+
+            "txin_detail":
+"""CREATE VIEW txin_detail AS SELECT
+    cc.chain_id,
+    cc.in_longest,
+    cc.block_id,
+    b.block_hash,
+    b.block_height,
+    block_tx.tx_pos,
+    tx.tx_id,
+    tx.tx_hash,
+    tx.tx_lockTime,
+    tx.tx_version,
+    tx.tx_size,
+    txin.txin_id,
+    txin.txin_pos,
+    txin.txout_id prevout_id""" + (""",
+    txin.txin_scriptSig,
+    txin.txin_sequence""" if store.keep_scriptsig else """,
+    NULL txin_scriptSig,
+    NULL txin_sequence""") + """,
+    prevout.txout_value txin_value,
+    prevout.txout_scriptPubKey txin_scriptPubKey,
+    pubkey.pubkey_id,
+    pubkey.pubkey_hash,
+    pubkey.pubkey
+  FROM chain_candidate cc
+  JOIN block b ON (cc.block_id = b.block_id)
+  JOIN block_tx ON (b.block_id = block_tx.block_id)
+  JOIN tx    ON (tx.tx_id = block_tx.tx_id)
+  JOIN txin  ON (tx.tx_id = txin.tx_id)
+  LEFT JOIN txout prevout ON (txin.txout_id = prevout.txout_id)
+  LEFT JOIN pubkey
+      ON (prevout.pubkey_id = pubkey.pubkey_id)""",
+
+            "txout_approx":
+# View of txout for drivers like sqlite3 that can not handle large
+# integer arithmetic.  For them, we transform the definition of
+# txout_approx_value to DOUBLE PRECISION (approximate) by a CAST.
+"""CREATE VIEW txout_approx AS SELECT
+    txout_id,
+    tx_id,
+    txout_value txout_approx_value
+  FROM txout""",
+
+            "configvar":
+# ABE accounting.  This table is read without knowledge of the
+# database's SQL quirks, so it must use only the most widely supported
+# features.
+"""CREATE TABLE configvar (
+    configvar_name  VARCHAR(100) NOT NULL PRIMARY KEY,
+    configvar_value VARCHAR(255)
+)""",
+
+            "abe_sequences":
+"""CREATE TABLE abe_sequences (
+    sequence_key VARCHAR(100) NOT NULL PRIMARY KEY,
+    nextid NUMERIC(30)
+)""",
+            }
+
+    def initialize(store):
+        """
+        Create the database schema.
+        """
+        store.config = {}
+        store.configure()
+
+        for stmt in (
+
+store._ddl['configvar'],
+
+"""CREATE TABLE datadir (
+    datadir_id  NUMERIC(10) NOT NULL PRIMARY KEY,
+    dirname     VARCHAR(2000) NOT NULL,
+    blkfile_number NUMERIC(8) NULL,
+    blkfile_offset NUMERIC(20) NULL,
+    chain_id    NUMERIC(10) NULL
+)""",
+
+# A block of the type used by Bitcoin.
+"""CREATE TABLE block (
+    block_id      NUMERIC(14) NOT NULL PRIMARY KEY,
+    block_hash    BINARY(32)  UNIQUE NOT NULL,
+    block_version NUMERIC(10),
+    block_hashMerkleRoot BINARY(32),
+    block_nTime   NUMERIC(20),
+    block_nBits   NUMERIC(10),
+    block_nNonce  NUMERIC(10),
+    block_height  NUMERIC(14) NULL,
+    prev_block_id NUMERIC(14) NULL,
+    search_block_id NUMERIC(14) NULL,
+    block_chain_work BINARY(""" + str(WORK_BITS / 8) + """),
+    block_value_in NUMERIC(30) NULL,
+    block_value_out NUMERIC(30),
+    block_total_satoshis NUMERIC(26) NULL,
+    block_total_seconds NUMERIC(20) NULL,
+    block_satoshi_seconds NUMERIC(28) NULL,
+    block_total_ss NUMERIC(28) NULL,
+    block_num_tx  NUMERIC(10) NOT NULL,
+    block_ss_destroyed NUMERIC(28) NULL,
+    FOREIGN KEY (prev_block_id)
+        REFERENCES block (block_id),
+    FOREIGN KEY (search_block_id)
+        REFERENCES block (block_id)
+)""",
+
+# CHAIN comprises a magic number, a policy, and (indirectly via
+# CHAIN_LAST_BLOCK_ID and the referenced block's ancestors) a genesis
+# block, possibly null.  A chain may have a currency code.
+"""CREATE TABLE chain (
+    chain_id    NUMERIC(10) NOT NULL PRIMARY KEY,
+    chain_name  VARCHAR(100) UNIQUE NOT NULL,
+    chain_code3 VARCHAR(5)  NULL,
+    chain_address_version VARBINARY(100) NOT NULL,
+    chain_script_addr_vers VARBINARY(100) NULL,
+    chain_magic BINARY(4)     NULL,
+    chain_policy VARCHAR(255) NOT NULL,
+    chain_decimals NUMERIC(2) NULL,
+    chain_last_block_id NUMERIC(14) NULL,
+    FOREIGN KEY (chain_last_block_id)
+        REFERENCES block (block_id)
+)""",
+
+# CHAIN_CANDIDATE lists blocks that are, or might become, part of the
+# given chain.  IN_LONGEST is 1 when the block is in the chain, else 0.
+# IN_LONGEST denormalizes information stored canonically in
+# CHAIN.CHAIN_LAST_BLOCK_ID and BLOCK.PREV_BLOCK_ID.
+"""CREATE TABLE chain_candidate (
+    chain_id      NUMERIC(10) NOT NULL,
+    block_id      NUMERIC(14) NOT NULL,
+    in_longest    NUMERIC(1),
+    block_height  NUMERIC(14),
+    PRIMARY KEY (chain_id, block_id),
+    FOREIGN KEY (block_id) REFERENCES block (block_id)
+)""",
+"""CREATE INDEX x_cc_block ON chain_candidate (block_id)""",
+"""CREATE INDEX x_cc_chain_block_height
+    ON chain_candidate (chain_id, block_height)""",
+"""CREATE INDEX x_cc_block_height ON chain_candidate (block_height)""",
+
+# An orphan block must remember its hashPrev.
+"""CREATE TABLE orphan_block (
+    block_id      NUMERIC(14) NOT NULL PRIMARY KEY,
+    block_hashPrev BINARY(32) NOT NULL,
+    FOREIGN KEY (block_id) REFERENCES block (block_id)
+)""",
+"""CREATE INDEX x_orphan_block_hashPrev ON orphan_block (block_hashPrev)""",
+
+# Denormalize the relationship inverse to BLOCK.PREV_BLOCK_ID.
+"""CREATE TABLE block_next (
+    block_id      NUMERIC(14) NOT NULL,
+    next_block_id NUMERIC(14) NOT NULL,
+    PRIMARY KEY (block_id, next_block_id),
+    FOREIGN KEY (block_id) REFERENCES block (block_id),
+    FOREIGN KEY (next_block_id) REFERENCES block (block_id)
+)""",
+
+# A transaction of the type used by Bitcoin.
+"""CREATE TABLE tx (
+    tx_id         NUMERIC(26) NOT NULL PRIMARY KEY,
+    tx_hash       BINARY(32)  UNIQUE NOT NULL,
+    tx_version    NUMERIC(10),
+    tx_lockTime   NUMERIC(10),
+    tx_size       NUMERIC(10)
+)""",
+
+# Mempool TX not linked to any block, we must track them somewhere
+# for efficient cleanup
+"""CREATE TABLE unlinked_tx (
+    tx_id        NUMERIC(26) NOT NULL,
+    PRIMARY KEY (tx_id),
+    FOREIGN KEY (tx_id)
+        REFERENCES tx (tx_id)
+)""",
+
+# Presence of transactions in blocks is many-to-many.
+"""CREATE TABLE block_tx (
+    block_id      NUMERIC(14) NOT NULL,
+    tx_id         NUMERIC(26) NOT NULL,
+    tx_pos        NUMERIC(10) NOT NULL,
+    PRIMARY KEY (block_id, tx_id),
+    UNIQUE (block_id, tx_pos),
+    FOREIGN KEY (block_id)
+        REFERENCES block (block_id),
+    FOREIGN KEY (tx_id)
+        REFERENCES tx (tx_id)
+)""",
+"""CREATE INDEX x_block_tx_tx ON block_tx (tx_id)""",
+
+# A public key for sending bitcoins.  PUBKEY_HASH is derivable from a
+# Bitcoin or Testnet address.
+"""CREATE TABLE pubkey (
+    pubkey_id     NUMERIC(26) NOT NULL PRIMARY KEY,
+    pubkey_hash   BINARY(20)  UNIQUE NOT NULL,
+    pubkey        VARBINARY(""" + str(MAX_PUBKEY) + """) NULL
+)""",
+
+"""CREATE TABLE multisig_pubkey (
+    multisig_id   NUMERIC(26) NOT NULL,
+    pubkey_id     NUMERIC(26) NOT NULL,
+    PRIMARY KEY (multisig_id, pubkey_id),
+    FOREIGN KEY (multisig_id) REFERENCES pubkey (pubkey_id),
+    FOREIGN KEY (pubkey_id) REFERENCES pubkey (pubkey_id)
+)""",
+"""CREATE INDEX x_multisig_pubkey_pubkey ON multisig_pubkey (pubkey_id)""",
+
+# A transaction out-point.
+"""CREATE TABLE txout (
+    txout_id      NUMERIC(26) NOT NULL PRIMARY KEY,
+    tx_id         NUMERIC(26) NOT NULL,
+    txout_pos     NUMERIC(10) NOT NULL,
+    txout_value   NUMERIC(30) NOT NULL,
+    txout_scriptPubKey VARBINARY(""" + str(MAX_SCRIPT) + """),
+    pubkey_id     NUMERIC(26),
+    UNIQUE (tx_id, txout_pos),
+    FOREIGN KEY (pubkey_id)
+        REFERENCES pubkey (pubkey_id)
+)""",
+"""CREATE INDEX x_txout_pubkey ON txout (pubkey_id)""",
+
+# A transaction in-point.
+"""CREATE TABLE txin (
+    txin_id       NUMERIC(26) NOT NULL PRIMARY KEY,
+    tx_id         NUMERIC(26) NOT NULL,
+    txin_pos      NUMERIC(10) NOT NULL,
+    txout_id      NUMERIC(26)""" + (""",
+    txin_scriptSig VARBINARY(""" + str(MAX_SCRIPT) + """),
+    txin_sequence NUMERIC(10)""" if store.keep_scriptsig else "") + """,
+    UNIQUE (tx_id, txin_pos),
+    FOREIGN KEY (tx_id)
+        REFERENCES tx (tx_id)
+)""",
+"""CREATE INDEX x_txin_txout ON txin (txout_id)""",
+
+# While TXIN.TXOUT_ID can not be found, we must remember TXOUT_POS,
+# a.k.a. PREVOUT_N.
+"""CREATE TABLE unlinked_txin (
+    txin_id       NUMERIC(26) NOT NULL PRIMARY KEY,
+    txout_tx_hash BINARY(32)  NOT NULL,
+    txout_pos     NUMERIC(10) NOT NULL,
+    FOREIGN KEY (txin_id) REFERENCES txin (txin_id)
+)""",
+"""CREATE INDEX x_unlinked_txin_outpoint
+    ON unlinked_txin (txout_tx_hash, txout_pos)""",
+
+"""CREATE TABLE block_txin (
+    block_id      NUMERIC(14) NOT NULL,
+    txin_id       NUMERIC(26) NOT NULL,
+    out_block_id  NUMERIC(14) NOT NULL,
+    PRIMARY KEY (block_id, txin_id),
+    FOREIGN KEY (block_id) REFERENCES block (block_id),
+    FOREIGN KEY (txin_id) REFERENCES txin (txin_id),
+    FOREIGN KEY (out_block_id) REFERENCES block (block_id)
+)""",
+
+store._ddl['chain_summary'],
+store._ddl['txout_detail'],
+store._ddl['txin_detail'],
+store._ddl['txout_approx'],
+
+"""CREATE TABLE abe_lock (
+    lock_id       NUMERIC(10) NOT NULL PRIMARY KEY,
+    pid           VARCHAR(255) NULL
+)""",
+):
+            try:
+                store.ddl(stmt)
+            except Exception:
+                store.log.error("Failed: %s", stmt)
+                raise
+
+        for key in ['chain', 'datadir',
+                    'tx', 'txout', 'pubkey', 'txin', 'block']:
+            store.create_sequence(key)
+
+        store.sql("INSERT INTO abe_lock (lock_id) VALUES (1)")
+
+        # Insert some well-known chain metadata.
+        for conf in CHAIN_CONFIG:
+            conf = conf.copy()
+            conf["name"] = conf.pop("chain")
+            if 'policy' in conf:
+                policy = conf.pop('policy')
+            else:
+                policy = conf['name']
+
+            chain = Chain.create(policy, **conf)
+            store.insert_chain(chain)
+
+        store.sql("""
+            INSERT INTO pubkey (pubkey_id, pubkey_hash) VALUES (?, ?)""",
+                  (NULL_PUBKEY_ID, store.binin(NULL_PUBKEY_HASH)))
+
+        if store.args.use_firstbits:
+            store.config['use_firstbits'] = "true"
+            store.ddl(
+                """CREATE TABLE abe_firstbits (
+                    pubkey_id       NUMERIC(26) NOT NULL,
+                    block_id        NUMERIC(14) NOT NULL,
+                    address_version VARBINARY(10) NOT NULL,
+                    firstbits       VARCHAR(50) NOT NULL,
+                    PRIMARY KEY (address_version, pubkey_id, block_id),
+                    FOREIGN KEY (pubkey_id) REFERENCES pubkey (pubkey_id),
+                    FOREIGN KEY (block_id) REFERENCES block (block_id)
+                )""")
+            store.ddl(
+                """CREATE INDEX x_abe_firstbits
+                    ON abe_firstbits (address_version, firstbits)""")
+        else:
+            store.config['use_firstbits'] = "false"
+
+        store.config['keep_scriptsig'] = \
+            "true" if store.args.keep_scriptsig else "false"
+
+        store.save_config()
+        store.commit()
+
+    def insert_chain(store, chain):
+        chain.id = store.new_id("chain")
+        store.sql("""
+            INSERT INTO chain (
+                chain_id, chain_magic, chain_name, chain_code3,
+                chain_address_version, chain_script_addr_vers, chain_policy, chain_decimals
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (chain.id, store.binin(chain.magic), chain.name,
+                   chain.code3, store.binin(chain.address_version), store.binin(chain.script_addr_vers),
+                   chain.policy, chain.decimals))
+
+    def get_lock(store):
+        if store.version_below('Abe26'):
+            return None
+        conn = store.connect()
+        cur = conn.cursor()
+        cur.execute("UPDATE abe_lock SET pid = %d WHERE lock_id = 1"
+                    % (os.getpid(),))
+        if cur.rowcount != 1:
+            raise Exception("unexpected rowcount")
+        cur.close()
+
+        # Check whether database supports concurrent updates.  Where it
+        # doesn't (SQLite) we get exclusive access automatically.
+        try:
+            import random
+            letters = "".join([chr(random.randint(65, 90)) for x in xrange(10)])
+            store.sql("""
+                INSERT INTO configvar (configvar_name, configvar_value)
+                VALUES (?, ?)""",
+                      ("upgrade-lock-" + letters, 'x'))
+        except Exception:
+            store.release_lock(conn)
+            conn = None
+
+        store.rollback()
+
+        # XXX Should reread config.
+
+        return conn
+
+    def release_lock(store, conn):
+        if conn:
+            conn.rollback()
+            conn.close()
+
+    def version_below(store, vers):
+        try:
+            sv = float(store.config['schema_version'].replace(SCHEMA_TYPE, ''))
+        except ValueError:
+            return False
+        vers = float(vers.replace(SCHEMA_TYPE, ''))
+        return sv < vers
+
+    def configure(store):
+        config = store._sql.configure()
+        store.init_binfuncs()
+        for name in config.keys():
+            store.config['sql.' + name] = config[name]
+
+    def save_config(store):
+
