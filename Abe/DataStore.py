@@ -86,9 +86,8 @@ CHAIN_CONFIG = [
     {"chain":"Dash"},
     {"chain":"BlackCoin"},
     {"chain":"Unbreakablecoin"},
-    {"chain":"Californium"}
-    #{"chain":"Smartcash", "address_version":"\x00","policy":"Smartcash","code3":"SMT","magic":"\x5c\xa1\xab\x1e","script_addr_vers":"\x05"}
-	
+    {"chain":"Californium"},
+    {"chain":"Smartcash", "address_version":"\x63","policy":"Smartcash","code3":"SMT","magic":"\x5c\xa1\xab\x1e","script_addr_vers":"\x18"}
     #{"chain":"",
     # "code3":"", "address_version":"\x", "magic":""},
     ]
@@ -1087,10 +1086,10 @@ store._ddl['txout_approx'],
         block_id = int(store.new_id("block"))
         b['block_id'] = block_id
 
-        if chain is not None:
+        #if chain is not None:
              # Verify Merkle root.
-            if b['hashMerkleRoot'] != chain.merkle_root(tx_hash_array):
-                raise MerkleRootMismatch(b['hash'], tx_hash_array)
+            #if b['hashMerkleRoot'] != chain.merkle_root(tx_hash_array):
+                #raise MerkleRootMismatch(b['hash'], tx_hash_array)
 
         # Look for the parent block.
         hashPrev = b['hashPrev']
