@@ -20,7 +20,7 @@ from . import BaseChain
 from .. import util
 from pprint import pprint
 
-class Smartcash(BaseChain):
+class Smartcash(KeccakChain):
     """
     A blockchain using 256-bit SHA3 (Keccak) as the block header hash.
     """
